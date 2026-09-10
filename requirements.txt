@@ -2,5 +2,6 @@ streamlit>=1.32
 pandas>=2.0
 numpy>=1.24
 matplotlib>=3.7
+mplsoccer>=1.4
 requests>=2.31
 statsbombpy>=1.11
