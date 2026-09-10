@@ -47,6 +47,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from mplsoccer import Pitch
 import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
@@ -71,37 +72,38 @@ PITCH_LINE = "#b0b0b0"
 
 METRICS = {
     "Pressures": {
-        "types": ["Pressure"], "value": None, "diverging": False,
+        "arrows": False, "types": ["Pressure"], "value": None, "diverging": False,
         "help": "Pressure events. High x = pressing high up the pitch.",
     },
     "Ball receipts": {
-        "types": ["Ball Receipt*"], "value": None, "diverging": False,
+        "arrows": False, "types": ["Ball Receipt*"], "value": None, "diverging": False,
         "help": "Where the team receives the ball.",
     },
     "OBV (for, net)": {
-        "types": None, "value": "obv_for_net", "diverging": True,
+        "arrows": True, "types": None, "value": "obv_for_net", "diverging": True,
         "help": "Summed on-ball value. Red adds value, blue loses it.",
     },
     "Defensive actions": {
-        "types": ["Pressure", "Duel", "Interception", "Block",
+        "arrows": False, "types": ["Pressure", "Duel", "Interception", "Block",
                   "Ball Recovery", "Foul Committed", "Clearance"],
         "value": None, "diverging": False,
         "help": "Pressures plus duels, interceptions, blocks, recoveries, "
                 "fouls and clearances.",
     },
     "Passes": {
-        "types": ["Pass"], "value": None, "diverging": False,
+        "arrows": True, "types": ["Pass"], "value": None, "diverging": False,
         "help": "Pass origins.",
     },
     "Carries": {
-        "types": ["Carry"], "value": None, "diverging": False,
+        "arrows": True, "types": ["Carry"], "value": None, "diverging": False,
         "help": "Carry origins.",
     },
 }
 
 KEEP = ["id", "index", "period", "minute", "second", "type.name", "team.name",
         "player.name", "position.name", "location", "obv_for_net",
-        "obv_against_net", "under_pressure", "counterpress"]
+        "obv_against_net", "under_pressure", "counterpress",
+        "pass.end_location", "carry.end_location", "pass.outcome.name"]
 
 
 # ----------------------------------------------------------------------------
@@ -168,41 +170,45 @@ def prepare(df):
     d["t"] = (d["period"].map(cum)
               + (d["clock"] - d["period"].map(starts)).clip(lower=0))
 
-    xs = np.full(len(d), np.nan)
-    ys = np.full(len(d), np.nan)
-    for i, v in enumerate(d["location"].to_numpy()):
-        if isinstance(v, (list, tuple)) and len(v) >= 2:
-            try:
-                xs[i] = float(v[0]); ys[i] = float(v[1])
-            except (TypeError, ValueError):
-                pass
-    d["x"], d["y"] = xs, ys
+    def unpack(col):
+        xs = np.full(len(d), np.nan)
+        ys = np.full(len(d), np.nan)
+        if col not in d.columns:
+            return xs, ys
+        for i, v in enumerate(d[col].to_numpy()):
+            if isinstance(v, (list, tuple)) and len(v) >= 2:
+                try:
+                    xs[i] = float(v[0]); ys[i] = float(v[1])
+                except (TypeError, ValueError):
+                    pass
+        return xs, ys
+
+    d["x"], d["y"] = unpack("location")
+    pex, pey = unpack("pass.end_location")
+    cex, cey = unpack("carry.end_location")
+    # one end-point column, whichever of the two the event carries
+    d["ex"] = np.where(np.isnan(pex), cex, pex)
+    d["ey"] = np.where(np.isnan(pey), cey, pey)
     return d, float(durs.sum()), durs.to_dict()
 
 
 # ----------------------------------------------------------------------------
-# PITCH + DENSITY
+# PITCH + DENSITY  (mplsoccer, StatsBomb dimensions)
 # ----------------------------------------------------------------------------
-def draw_pitch(ax):
-    ax.set_facecolor(BG)
-    L = dict(color=PITCH_LINE, lw=1.0, zorder=5)
-    ax.plot([0, 120, 120, 0, 0], [0, 0, 80, 80, 0], **L)
-    ax.plot([60, 60], [0, 80], **L)
-    th = np.linspace(0, 2 * np.pi, 200)
-    ax.plot(60 + 10 * np.cos(th), 40 + 10 * np.sin(th), **L)
-    for sx, ex in [(0, 18), (102, 120)]:
-        ax.plot([sx, ex, ex, sx], [18, 18, 62, 62], **L)
-    for sx, ex in [(0, 6), (114, 120)]:
-        ax.plot([sx, ex, ex, sx], [30, 30, 50, 50], **L)
-    ax.scatter([12, 108], [40, 40], s=6, color=PITCH_LINE, zorder=5)
-    ax.plot([0, 0], [36, 44], color="#666", lw=3, zorder=5)
-    ax.plot([120, 120], [36, 44], color="#666", lw=3, zorder=5)
-    ax.set_xlim(-2, 122)
-    ax.set_ylim(82, -2)          # StatsBomb origin is top-left
-    ax.set_aspect("equal")
-    ax.set_xticks([]); ax.set_yticks([])
-    for s in ax.spines.values():
-        s.set_visible(False)
+def make_pitch():
+    """
+    mplsoccer pitch on StatsBomb's 120x80 grid.
+
+    line_zorder=2 is what puts the pitch markings ON TOP of the heatmap — the
+    heatmap is drawn at zorder 1. Without it the shading covers the lines and
+    the box and circle become unreadable.
+
+    mplsoccer also handles StatsBomb's top-left origin, so no manual y-axis
+    inversion is needed here.
+    """
+    return Pitch(pitch_type="statsbomb", pitch_color=BG,
+                 line_color=PITCH_LINE, line_zorder=2, linewidth=1.0,
+                 spot_scale=0.004)
 
 
 def _blur(a, sigma):
@@ -216,60 +222,120 @@ def _blur(a, sigma):
     return np.apply_along_axis(f, 0, np.apply_along_axis(f, 1, a))
 
 
-def density(sub, minutes, bins_x, bins_y, sigma, value_col=None):
-    """Per-minute density. Weighted by value_col when one is given."""
+def bin_density(pitch, sub, minutes, bins_x, bins_y, sigma, value_col=None):
+    """
+    Per-minute binned density via mplsoccer's bin_statistic, so the extent and
+    orientation always match the pitch it is drawn on.
+    """
     if not len(sub):
-        return np.zeros((bins_y, bins_x))
-    w = None
+        stat = pitch.bin_statistic(np.array([]), np.array([]),
+                                   bins=(bins_x, bins_y))
+        stat["statistic"] = np.zeros_like(stat["statistic"], dtype=float)
+        return stat
+
     if value_col:
-        w = sub[value_col].fillna(0).values
-    H, _, _ = np.histogram2d(sub["x"].values, sub["y"].values,
-                             bins=[bins_x, bins_y],
-                             range=[[0, 120], [0, 80]], weights=w)
-    return _blur(H, sigma).T / max(minutes, 1e-9)
+        stat = pitch.bin_statistic(
+            sub["x"].values, sub["y"].values,
+            values=sub[value_col].fillna(0).values,
+            statistic="sum", bins=(bins_x, bins_y))
+    else:
+        stat = pitch.bin_statistic(sub["x"].values, sub["y"].values,
+                                   statistic="count", bins=(bins_x, bins_y))
+
+    stat["statistic"] = _blur(np.nan_to_num(stat["statistic"], nan=0.0),
+                              sigma) / max(minutes, 1e-9)
+    return stat
+
+
+def draw_heat(pitch, ax, stat, cmap, vmin=None, vmax=None, norm=None):
+    """
+    Draw a bin_statistic grid with bilinear interpolation.
+
+    mplsoccer's pitch.heatmap uses pcolormesh, which cannot interpolate and
+    leaves visible 4-yard blocks. imshow on the same axes is smooth. The
+    orientation was verified against a scatter of the same events: row 0 of
+    bin_statistic is low y, and mplsoccer's statsbomb axes run y from 80 at the
+    bottom to 0 at the top, so extent=[0,120,80,0] with origin="upper" lines up.
+    """
+    S = np.nan_to_num(stat["statistic"], nan=0.0)
+    kw = dict(extent=[0, 120, 80, 0], origin="upper", cmap=cmap, alpha=0.9,
+              interpolation="bilinear", zorder=1, aspect="auto")
+    if norm is not None:
+        return ax.imshow(S, norm=norm, **kw)
+    return ax.imshow(S, vmin=vmin, vmax=vmax, **kw)
+
+
+def _draw_arrows(pitch, ax, sub, color, max_arrows=600):
+    """
+    Passes and carries as arrows rather than dots. Incomplete passes are drawn
+    faint and grey so completion is visible without a second chart.
+    """
+    d = sub.dropna(subset=["x", "y", "ex", "ey"])
+    if not len(d):
+        return 0
+    if len(d) > max_arrows:
+        d = d.sample(max_arrows, random_state=0)
+
+    done = d["pass.outcome.name"].isna() if "pass.outcome.name" in d.columns \
+        else pd.Series(True, index=d.index)
+
+    ok, bad = d[done], d[~done]
+    if len(bad):
+        pitch.arrows(bad["x"], bad["y"], bad["ex"], bad["ey"], ax=ax,
+                     width=1.0, headwidth=4, headlength=4,
+                     color="#9a9a9a", alpha=0.30, zorder=3)
+    if len(ok):
+        pitch.arrows(ok["x"], ok["y"], ok["ex"], ok["ey"], ax=ax,
+                     width=1.4, headwidth=4.5, headlength=4.5,
+                     color=color, alpha=0.72, zorder=4)
+    return len(d)
 
 
 def heat_figure(win, sub_all, total, minutes, spec, opts, header):
-    fig, ax = plt.subplots(figsize=(9.2, 6.2))
+    pitch = make_pitch()
+    fig, ax = pitch.draw(figsize=(9.4, 6.4))
     fig.patch.set_facecolor(BG)
-    draw_pitch(ax)
 
     val = spec["value"]
-    dens = density(win, minutes, opts["bx"], opts["by"], opts["sigma"], val)
+    stat = bin_density(pitch, win, minutes, opts["bx"], opts["by"],
+                       opts["sigma"], val)
 
     if spec["diverging"]:
-        lim = (np.abs(dens).max() if opts["autoscale"]
-               else max(np.abs(density(sub_all, total, opts["bx"], opts["by"],
-                                       opts["sigma"], val)).max()
-                        * opts["vmax_mult"], 1e-9))
-        lim = max(lim, 1e-9)
-        ax.imshow(dens, extent=[0, 120, 80, 0], origin="upper", cmap=DIVERGE,
-                  norm=TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim),
-                  alpha=0.9, interpolation="bilinear", zorder=1,
-                  aspect="equal")
+        ref = bin_density(pitch, sub_all, total, opts["bx"], opts["by"],
+                          opts["sigma"], val)
+        lim = (np.abs(stat["statistic"]).max() if opts["autoscale"]
+               else np.abs(ref["statistic"]).max() * opts["vmax_mult"])
+        lim = max(float(lim), 1e-9)
+        draw_heat(pitch, ax, stat, DIVERGE,
+                  norm=TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim))
     else:
-        vmax = (max(dens.max(), 1e-9) if opts["autoscale"]
-                else max(density(sub_all, total, opts["bx"], opts["by"],
-                                 opts["sigma"]).max() * opts["vmax_mult"],
-                         1e-9))
-        ax.imshow(dens, extent=[0, 120, 80, 0], origin="upper", cmap=HEAT,
-                  vmin=0, vmax=vmax, alpha=0.9, interpolation="bilinear",
-                  zorder=1, aspect="equal")
+        ref = bin_density(pitch, sub_all, total, opts["bx"], opts["by"],
+                          opts["sigma"])
+        vmax = (stat["statistic"].max() if opts["autoscale"]
+                else ref["statistic"].max() * opts["vmax_mult"])
+        vmax = max(float(vmax), 1e-9)
+        draw_heat(pitch, ax, stat, HEAT, vmin=0, vmax=vmax)
 
-    if opts["show_events"] and len(win):
-        ax.scatter(win["x"], win["y"], s=18, facecolor="none",
-                   edgecolor="#2b2b2b", linewidth=0.7, alpha=0.55, zorder=6)
+    n_arrows = 0
+    if opts["arrows"] and spec.get("arrows") and len(win):
+        n_arrows = _draw_arrows(pitch, ax, win, "#2b2b2b")
+    elif opts["show_events"] and len(win):
+        pitch.scatter(win["x"], win["y"], ax=ax, s=18, facecolor="none",
+                      edgecolor="#2b2b2b", linewidth=0.7, alpha=0.55, zorder=4)
 
+    if n_arrows and n_arrows < len(win.dropna(subset=["x", "y", "ex", "ey"])):
+        header += f"   ({n_arrows} arrows shown)"
     ax.set_title(header, fontsize=12, fontweight="bold", pad=10)
-    ax.text(1, 79.5, "own goal", fontsize=8, color="#a8a8a8", va="bottom")
+    ax.text(1, 79.5, "own goal", fontsize=8, color="#a8a8a8", va="bottom",
+            zorder=5)
     ax.text(119, 79.5, "attacking →", fontsize=8, color="#a8a8a8",
-            va="bottom", ha="right")
+            va="bottom", ha="right", zorder=5)
     fig.tight_layout()
     return fig
 
 
 def timeline_figure(sub, total, lo, hi, label):
-    fig, ax = plt.subplots(figsize=(9.2, 1.9))
+    fig, ax = plt.subplots(figsize=(9.4, 1.9))
     fig.patch.set_facecolor(BG)
     ax.set_facecolor(BG)
     edges = np.arange(0, total + 1, 1.0)
@@ -283,8 +349,8 @@ def timeline_figure(sub, total, lo, hi, label):
     ax.set_yticks([])
     ax.set_xlabel("elapsed minutes", fontsize=9)
     ax.set_title(f"{label} per minute — selected window in red", fontsize=9.5)
-    for s in ["top", "right", "left"]:
-        ax.spines[s].set_visible(False)
+    for sp in ["top", "right", "left"]:
+        ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color("#cfcfcf")
     fig.tight_layout()
     return fig
@@ -298,53 +364,52 @@ def grid_figure(sub, total, window, spec, opts, team, label):
     cols = 3
     rows = int(np.ceil(n / cols))
 
+    pitch = make_pitch()
     val = spec["value"]
-    if spec["diverging"]:
-        shared = max(np.abs(density(sub, total, opts["bx"], opts["by"],
-                                    opts["sigma"], val)).max()
-                     * opts["vmax_mult"], 1e-9)
-    else:
-        shared = max(density(sub, total, opts["bx"], opts["by"],
-                             opts["sigma"]).max() * opts["vmax_mult"], 1e-9)
+    ref = bin_density(pitch, sub, total, opts["bx"], opts["by"],
+                      opts["sigma"], val if spec["diverging"] else None)
+    shared = max(float(np.abs(ref["statistic"]).max()) * opts["vmax_mult"],
+                 1e-9)
 
-    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 3.4 * rows),
-                             squeeze=False)
+    fig, axes = pitch.grid(nrows=rows, ncols=cols, figheight=3.6 * rows,
+                           title_height=0.06, endnote_height=0.0,
+                           space=0.10, axis=False)
     fig.patch.set_facecolor(BG)
-    for i in range(rows * cols):
-        ax = axes[i // cols, i % cols]
+    pitch_axes = np.atleast_1d(axes["pitch"]).ravel()
+
+    for i, ax in enumerate(pitch_axes):
         if i >= n:
             ax.set_visible(False)
             continue
         lo, hi = edges[i], edges[i + 1]
-        w = sub[(sub["t"] >= lo) & (sub["t"] < hi)].dropna(subset=["x", "y"])
-        draw_pitch(ax)
-        dens = density(w, hi - lo, opts["bx"], opts["by"], opts["sigma"], val)
+        w = sub[(sub["t"] >= lo) & (sub["t"] < hi)]
+        stat = bin_density(pitch, w, hi - lo, opts["bx"], opts["by"],
+                           opts["sigma"], val)
         if spec["diverging"]:
-            ax.imshow(dens, extent=[0, 120, 80, 0], origin="upper",
-                      cmap=DIVERGE,
+            draw_heat(pitch, ax, stat, DIVERGE,
                       norm=TwoSlopeNorm(vmin=-shared, vcenter=0.0,
-                                        vmax=shared),
-                      alpha=0.9, interpolation="bilinear", zorder=1,
-                      aspect="equal")
+                                        vmax=shared))
         else:
-            ax.imshow(dens, extent=[0, 120, 80, 0], origin="upper", cmap=HEAT,
-                      vmin=0, vmax=shared, alpha=0.9,
-                      interpolation="bilinear", zorder=1, aspect="equal")
-        if opts["show_events"] and len(w):
-            ax.scatter(w["x"], w["y"], s=11, facecolor="none",
-                       edgecolor="#2b2b2b", linewidth=0.6, alpha=0.5, zorder=6)
-        extra = ""
-        if val:
-            extra = f"   {w[val].fillna(0).sum():+.2f}"
+            draw_heat(pitch, ax, stat, HEAT, vmin=0, vmax=shared)
+
+        if opts["arrows"] and spec.get("arrows") and len(w):
+            _draw_arrows(pitch, ax, w, "#2b2b2b", max_arrows=200)
+        elif opts["show_events"] and len(w):
+            pitch.scatter(w["x"], w["y"], ax=ax, s=11, facecolor="none",
+                          edgecolor="#2b2b2b", linewidth=0.6, alpha=0.5,
+                          zorder=4)
+
+        extra = f"   {w[val].fillna(0).sum():+.2f}" if val else ""
         ax.set_title(f"{lo:.0f}′–{hi:.0f}′   {len(w)} ev{extra}",
                      fontsize=9.5, fontweight="bold")
 
-    fig.suptitle(f"{team} — {label}, {window:.0f}-minute windows, "
-                 f"common colour scale",
-                 fontsize=12, fontweight="bold", x=0.02, ha="left")
-    fig.tight_layout(rect=[0, 0, 1, 0.94], h_pad=2.4)
+    axes["title"].text(0.5, 0.5,
+                       f"{team} — {label}, {window:.0f}-minute windows, "
+                       f"common colour scale",
+                       ha="center", va="center", fontsize=13,
+                       fontweight="bold")
+    axes["title"].axis("off")
     return fig
-
 
 
 # ----------------------------------------------------------------------------
@@ -359,8 +424,7 @@ def stretch_button(col, label):
 
 
 def show_fig(fig):
-    """st.pyplot across versions: `width=` is current, `use_container_width=`
-    is deprecated after 2025-12-31 but needed on older builds."""
+    """`width=` is current; `use_container_width=` is needed on older builds."""
     try:
         st.pyplot(fig, width="stretch")
     except TypeError:
@@ -504,35 +568,64 @@ with st.sidebar:
     st.caption(spec["help"])
 
     st.header("Window")
-    length = st.slider("Window length (minutes)", MIN_WINDOW,
-                       float(round(total)), DEFAULT_WINDOW, step=0.5,
-                       help=f"Minimum {MIN_WINDOW:.0f} minutes.")
-    max_start = max(0.0, total - length)
-    # Streamlit warns if a widget has BOTH a default value and a session_state
-    # entry under its key. So seed session_state, clamp it, and let the widget
-    # read from it — no `value=` argument.
-    if "start" not in st.session_state:
-        st.session_state.start = 0.0
-    st.session_state.start = float(
-        min(max(st.session_state.start, 0.0), max_start))
+    tmax = float(np.ceil(total))
+
+    # Two handles: drag either end to resize, drag the middle to scrub. A
+    # single start slider made it awkward to land on specific second-half
+    # minutes, which is the main thing this control is for.
+    if "window" not in st.session_state:
+        st.session_state.window = (0.0, min(DEFAULT_WINDOW, tmax))
+
+    w0, w1 = st.session_state.window
+    st.session_state.window = (float(np.clip(w0, 0.0, tmax)),
+                               float(np.clip(w1, 0.0, tmax)))
 
     c1, c2, c3 = st.columns(3)
+    shift = 0.0
     if stretch_button(c1, "◀ −1"):
-        st.session_state.start = max(0.0, st.session_state.start - 1.0)
+        shift = -1.0
     if stretch_button(c2, "reset"):
-        st.session_state.start = 0.0
+        st.session_state.window = (0.0, min(DEFAULT_WINDOW, tmax))
     if stretch_button(c3, "+1 ▶"):
-        st.session_state.start = min(max_start, st.session_state.start + 1.0)
+        shift = 1.0
+    if shift:
+        a, b = st.session_state.window
+        span = b - a
+        a = float(np.clip(a + shift, 0.0, tmax - span))
+        st.session_state.window = (a, a + span)
 
-    start = st.slider("Window start (minutes)", 0.0, max(max_start, 0.5),
-                      step=0.5, key="start")
-    lo, hi = float(start), float(min(start + length, total))
+    sel_lo, sel_hi = st.slider("Window (minutes)", 0.0, tmax, step=0.5,
+                               key="window")
+    sel_lo, sel_hi = float(sel_lo), float(sel_hi)
+
+    # The minimum is applied to the ANALYSIS window, not by rewriting the
+    # widget: Streamlit raises if session_state is modified after the widget
+    # with that key exists. The handles stay where you put them and the
+    # caption says what was actually used.
+    lo, hi = sel_lo, sel_hi
+    widened = False
+    if hi - lo < MIN_WINDOW:
+        hi = min(lo + MIN_WINDOW, tmax)
+        lo = max(0.0, hi - MIN_WINDOW)
+        widened = True
+
+    length = hi - lo
+    if widened:
+        st.caption(f"⚠ Widened to the {MIN_WINDOW:.0f}-minute minimum: "
+                   f"**{lo:.1f}′ – {hi:.1f}′**")
+    else:
+        st.caption(f"{lo:.1f}′ – {hi:.1f}′  ·  {length:.1f} min  "
+                   f"(minimum {MIN_WINDOW:.0f})")
 
     st.header("Display")
     grid_mode = st.checkbox("Show grid of consecutive windows", value=False)
+    arrows = st.checkbox("Draw passes/carries as arrows", value=True,
+                         help="Applies to Passes, Carries and OBV. Completed "
+                              "in colour, incomplete faint grey.")
     show_events = st.checkbox("Show individual events", value=True,
-                              help="Leave this on. It shows how many events "
-                                   "the shading actually rests on.")
+                              help="Leave this on for the non-arrow metrics. "
+                                   "It shows how many events the shading "
+                                   "actually rests on.")
     autoscale = st.checkbox("Scale colour to window", value=False,
                             help="Off = fixed scale, so windows are "
                                  "comparable. On = each window scaled to "
@@ -545,7 +638,7 @@ with st.sidebar:
                               step=0.5)
 
 opts = dict(bx=bx, by=by, sigma=sigma, autoscale=autoscale,
-            show_events=show_events, vmax_mult=vmax_mult)
+            show_events=show_events, vmax_mult=vmax_mult, arrows=arrows)
 
 sub_all = ev[ev["team.name"] == team]
 if spec["types"]:
