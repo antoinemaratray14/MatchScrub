@@ -1,42 +1,3 @@
-"""
-Match Heatmap Explorer — StatsBomb events, scrubbable time windows.
-
-Run it from a terminal (NOT from inside Spyder):
-
-    streamlit run pressure_app.py
-
-Metrics: pressures, ball receipts, OBV, and defensive actions. Drag the window
-start to scrub through the match; the window length is a separate control so it
-stays fixed while you scrub, and it cannot go below MIN_WINDOW minutes.
-
-CREDENTIALS
------------
-Read from environment variables first, then .streamlit/secrets.toml, then the
-sidebar. Don't commit them: add .streamlit/secrets.toml to .gitignore.
-
-    export SB_USER="..."   export SB_PASS="..."
-
-TWO THINGS THAT WOULD OTHERWISE MISLEAD
----------------------------------------
-1. DENSITY IS PER MINUTE. Otherwise a 20-minute window looks five times more
-   intense than a 2-minute one purely because it is longer, and scrubbing tells
-   you nothing. With a per-minute rate and a fixed colour ceiling, windows of
-   different lengths are directly comparable. "Scale to window" is available
-   for looking at structure inside a quiet spell, but it makes windows
-   non-comparable, which is why it is off by default.
-
-2. SMALL SAMPLES ARE SHOWN AS POINTS. At the 2-minute minimum you are looking
-   at a handful of events. Individual events are drawn on top and the count is
-   displayed, so a smooth-looking blob built on four events is visibly built on
-   four events.
-
-DIRECTION: coordinates are normalised so the team performing the action attacks
-toward x = 120. For pressures that means high x is pressing high up the pitch.
-The two teams sit in opposite frames and cannot be overlaid, so pick one team.
-
-OBV is summed, not counted, and can be negative — it uses a diverging colour
-scale centred on zero. Red is value added, blue is value lost.
-"""
 
 import os
 import time
@@ -525,11 +486,49 @@ with st.sidebar:
         st.error(f"Could not load competitions: {exc}")
         st.stop()
 
-    comps["label"] = (comps["competition_name"] + " — "
-                      + comps["season_name"].astype(str))
-    comp_label = st.selectbox("Competition and season",
-                              sorted(comps["label"].unique()))
-    row = comps[comps["label"] == comp_label].iloc[0]
+    # Competition names are NOT unique: "Premier League" exists in England,
+    # Egypt, Ukraine and elsewhere, and men's and women's competitions share
+    # names too. Selecting on name alone silently picks whichever row happens
+    # to come first. So cascade country -> competition -> season, and keep
+    # gender in the competition label when a name is used for more than one.
+    for col, default in [("country_name", "Unknown"),
+                         ("competition_gender", ""),
+                         ("competition_name", "?"),
+                         ("season_name", "?")]:
+        if col not in comps.columns:
+            comps[col] = default
+        comps[col] = comps[col].fillna(default).astype(str)
+
+    gender_counts = (comps.groupby(["country_name", "competition_name"])
+                     ["competition_gender"].nunique())
+    def comp_label(r):
+        multi = gender_counts.get((r["country_name"],
+                                   r["competition_name"]), 1) > 1
+        g = r["competition_gender"].strip()
+        return (f"{r['competition_name']} ({g})"
+                if multi and g else r["competition_name"])
+    comps["comp_label"] = comps.apply(comp_label, axis=1)
+
+    countries = sorted(comps["country_name"].unique())
+    default_country = countries.index("England") if "England" in countries else 0
+    country = st.selectbox("Country", countries, index=default_country)
+
+    in_country = comps[comps["country_name"] == country]
+    comp_choice = st.selectbox("Competition",
+                               sorted(in_country["comp_label"].unique()))
+
+    in_comp = in_country[in_country["comp_label"] == comp_choice]
+    seasons = in_comp.sort_values("season_name", ascending=False)
+    season_choice = st.selectbox("Season", seasons["season_name"].tolist())
+
+    row = seasons[seasons["season_name"] == season_choice]
+    if len(row) > 1:
+        st.warning(f"{len(row)} rows match that selection — using the first. "
+                   f"competition_id "
+                   f"{sorted(row['competition_id'].unique())}")
+    row = row.iloc[0]
+    st.caption(f"competition_id {int(row['competition_id'])} · "
+               f"season_id {int(row['season_id'])}")
 
     try:
         matches = load_matches(int(row["competition_id"]),
