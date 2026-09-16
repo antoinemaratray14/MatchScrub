@@ -1,7 +1,7 @@
 
 import os
 import time
-
+ 
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -12,7 +12,7 @@ from mplsoccer import Pitch
 import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
-
+ 
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
@@ -20,17 +20,17 @@ API_BASE = "https://data.statsbombservices.com/api"
 EVENTS_VERSION = "v11"
 MATCHES_VERSION = "v6"
 COMPETITIONS_VERSION = "v4"
-
+ 
 MIN_WINDOW = 2.0
 DEFAULT_WINDOW = 15.0
-
+ 
 BG = "#faf8f5"
 HEAT = LinearSegmentedColormap.from_list(
     "heat", ["#faf8f5", "#f7d9c4", "#f0a07a", "#dc5b3c", "#a5281c", "#5e0f0a"])
 DIVERGE = LinearSegmentedColormap.from_list(
     "div", ["#1f5f8b", "#8fbcd9", "#faf8f5", "#f0a07a", "#a5281c"])
 PITCH_LINE = "#b0b0b0"
-
+ 
 METRICS = {
     "Pressures": {
         "arrows": False, "types": ["Pressure"], "value": None, "diverging": False,
@@ -51,6 +51,18 @@ METRICS = {
         "help": "Pressures plus duels, interceptions, blocks, recoveries, "
                 "fouls and clearances.",
     },
+    "Fouls committed": {
+        "arrows": False, "types": ["Foul Committed"], "value": None,
+        "diverging": False,
+        "help": "Fouls given against this team. Low x = conceded in their own "
+                "half.",
+    },
+    "Fouls won": {
+        "arrows": False, "types": ["Foul Won"], "value": None,
+        "diverging": False,
+        "help": "Fouls awarded to this team. High x = won in the opposition "
+                "half.",
+    },
     "Passes": {
         "arrows": True, "types": ["Pass"], "value": None, "diverging": False,
         "help": "Pass origins.",
@@ -60,13 +72,13 @@ METRICS = {
         "help": "Carry origins.",
     },
 }
-
+ 
 KEEP = ["id", "index", "period", "minute", "second", "type.name", "team.name",
         "player.name", "position.name", "location", "obv_for_net",
         "obv_against_net", "under_pressure", "counterpress",
         "pass.end_location", "carry.end_location", "pass.outcome.name"]
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
 # DATA
 # ----------------------------------------------------------------------------
@@ -79,28 +91,28 @@ def _get(url, user, pw, tries=4):
         r.raise_for_status()
         return r.json()
     raise RuntimeError(f"failed after {tries} attempts: {url}")
-
-
+ 
+ 
 @st.cache_data(show_spinner="Loading competitions…", ttl=3600)
 def load_competitions(user, _pw):
     js = _get(f"{API_BASE}/{COMPETITIONS_VERSION}/competitions", user, _pw)
     return pd.DataFrame(js)
-
-
+ 
+ 
 @st.cache_data(show_spinner="Loading fixtures…", ttl=3600)
 def load_matches(comp_id, season_id, user, _pw):
     js = _get(f"{API_BASE}/{MATCHES_VERSION}/competitions/{comp_id}/"
               f"seasons/{season_id}/matches", user, _pw)
     return pd.json_normalize(js, sep=".")
-
-
+ 
+ 
 @st.cache_data(show_spinner="Loading events…", ttl=3600, max_entries=20)
 def load_events(match_id, user, _pw):
     js = _get(f"{API_BASE}/{EVENTS_VERSION}/events/{match_id}", user, _pw)
     df = pd.json_normalize(js, sep=".")
     return df.reindex(columns=[c for c in KEEP if c in df.columns])
-
-
+ 
+ 
 @st.cache_data(show_spinner="Preparing events…", ttl=3600, max_entries=20)
 def get_match_data(match_id, user, _pw):
     """
@@ -110,8 +122,8 @@ def get_match_data(match_id, user, _pw):
     change, which is slow and silent.
     """
     return prepare(load_events(match_id, user, _pw))
-
-
+ 
+ 
 def prepare(df):
     """Elapsed-minute clock plus x/y. Returns (events, total_minutes, periods)."""
     d = df[pd.to_numeric(df["period"], errors="coerce") <= 4].copy()
@@ -121,7 +133,7 @@ def prepare(df):
     d["clock"] = d["minute"] + d["second"] / 60.0
     if "obv_for_net" in d.columns:
         d["obv_for_net"] = pd.to_numeric(d["obv_for_net"], errors="coerce")
-
+ 
     # `minute` resets to 45 at half-time, so elapsed time must be built up
     # period by period or the timeline jumps backwards mid-match.
     g = d.groupby("period")["clock"].agg(["min", "max"])
@@ -130,7 +142,7 @@ def prepare(df):
     starts = g["min"]
     d["t"] = (d["period"].map(cum)
               + (d["clock"] - d["period"].map(starts)).clip(lower=0))
-
+ 
     def unpack(col):
         xs = np.full(len(d), np.nan)
         ys = np.full(len(d), np.nan)
@@ -143,7 +155,7 @@ def prepare(df):
                 except (TypeError, ValueError):
                     pass
         return xs, ys
-
+ 
     d["x"], d["y"] = unpack("location")
     pex, pey = unpack("pass.end_location")
     cex, cey = unpack("carry.end_location")
@@ -151,27 +163,27 @@ def prepare(df):
     d["ex"] = np.where(np.isnan(pex), cex, pex)
     d["ey"] = np.where(np.isnan(pey), cey, pey)
     return d, float(durs.sum()), durs.to_dict()
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
 # PITCH + DENSITY  (mplsoccer, StatsBomb dimensions)
 # ----------------------------------------------------------------------------
 def make_pitch():
     """
     mplsoccer pitch on StatsBomb's 120x80 grid.
-
+ 
     line_zorder=2 is what puts the pitch markings ON TOP of the heatmap — the
     heatmap is drawn at zorder 1. Without it the shading covers the lines and
     the box and circle become unreadable.
-
+ 
     mplsoccer also handles StatsBomb's top-left origin, so no manual y-axis
     inversion is needed here.
     """
     return Pitch(pitch_type="statsbomb", pitch_color=BG,
                  line_color=PITCH_LINE, line_zorder=2, linewidth=1.0,
                  spot_scale=0.004)
-
-
+ 
+ 
 def _blur(a, sigma):
     """Separable Gaussian blur — avoids a scipy dependency."""
     if sigma <= 0:
@@ -181,8 +193,8 @@ def _blur(a, sigma):
     k /= k.sum()
     f = lambda m: np.convolve(np.pad(m, r, mode="edge"), k, mode="same")[r:-r]
     return np.apply_along_axis(f, 0, np.apply_along_axis(f, 1, a))
-
-
+ 
+ 
 def bin_density(pitch, sub, minutes, bins_x, bins_y, sigma, value_col=None):
     """
     Per-minute binned density via mplsoccer's bin_statistic, so the extent and
@@ -193,7 +205,7 @@ def bin_density(pitch, sub, minutes, bins_x, bins_y, sigma, value_col=None):
                                    bins=(bins_x, bins_y))
         stat["statistic"] = np.zeros_like(stat["statistic"], dtype=float)
         return stat
-
+ 
     if value_col:
         stat = pitch.bin_statistic(
             sub["x"].values, sub["y"].values,
@@ -202,16 +214,16 @@ def bin_density(pitch, sub, minutes, bins_x, bins_y, sigma, value_col=None):
     else:
         stat = pitch.bin_statistic(sub["x"].values, sub["y"].values,
                                    statistic="count", bins=(bins_x, bins_y))
-
+ 
     stat["statistic"] = _blur(np.nan_to_num(stat["statistic"], nan=0.0),
                               sigma) / max(minutes, 1e-9)
     return stat
-
-
+ 
+ 
 def draw_heat(pitch, ax, stat, cmap, vmin=None, vmax=None, norm=None):
     """
     Draw a bin_statistic grid with bilinear interpolation.
-
+ 
     mplsoccer's pitch.heatmap uses pcolormesh, which cannot interpolate and
     leaves visible 4-yard blocks. imshow on the same axes is smooth. The
     orientation was verified against a scatter of the same events: row 0 of
@@ -224,8 +236,8 @@ def draw_heat(pitch, ax, stat, cmap, vmin=None, vmax=None, norm=None):
     if norm is not None:
         return ax.imshow(S, norm=norm, **kw)
     return ax.imshow(S, vmin=vmin, vmax=vmax, **kw)
-
-
+ 
+ 
 def _draw_arrows(pitch, ax, sub, color, max_arrows=600):
     """
     Passes and carries as arrows rather than dots. Incomplete passes are drawn
@@ -236,10 +248,10 @@ def _draw_arrows(pitch, ax, sub, color, max_arrows=600):
         return 0
     if len(d) > max_arrows:
         d = d.sample(max_arrows, random_state=0)
-
+ 
     done = d["pass.outcome.name"].isna() if "pass.outcome.name" in d.columns \
         else pd.Series(True, index=d.index)
-
+ 
     ok, bad = d[done], d[~done]
     if len(bad):
         pitch.arrows(bad["x"], bad["y"], bad["ex"], bad["ey"], ax=ax,
@@ -250,17 +262,17 @@ def _draw_arrows(pitch, ax, sub, color, max_arrows=600):
                      width=1.4, headwidth=4.5, headlength=4.5,
                      color=color, alpha=0.72, zorder=4)
     return len(d)
-
-
+ 
+ 
 def heat_figure(win, sub_all, total, minutes, spec, opts, header):
     pitch = make_pitch()
     fig, ax = pitch.draw(figsize=(9.4, 6.4))
     fig.patch.set_facecolor(BG)
-
+ 
     val = spec["value"]
     stat = bin_density(pitch, win, minutes, opts["bx"], opts["by"],
                        opts["sigma"], val)
-
+ 
     if spec["diverging"]:
         ref = bin_density(pitch, sub_all, total, opts["bx"], opts["by"],
                           opts["sigma"], val)
@@ -276,14 +288,14 @@ def heat_figure(win, sub_all, total, minutes, spec, opts, header):
                 else ref["statistic"].max() * opts["vmax_mult"])
         vmax = max(float(vmax), 1e-9)
         draw_heat(pitch, ax, stat, HEAT, vmin=0, vmax=vmax)
-
+ 
     n_arrows = 0
     if opts["arrows"] and spec.get("arrows") and len(win):
         n_arrows = _draw_arrows(pitch, ax, win, "#2b2b2b")
     elif opts["show_events"] and len(win):
         pitch.scatter(win["x"], win["y"], ax=ax, s=18, facecolor="none",
                       edgecolor="#2b2b2b", linewidth=0.7, alpha=0.55, zorder=4)
-
+ 
     if n_arrows and n_arrows < len(win.dropna(subset=["x", "y", "ex", "ey"])):
         header += f"   ({n_arrows} arrows shown)"
     ax.set_title(header, fontsize=12, fontweight="bold", pad=10)
@@ -293,8 +305,8 @@ def heat_figure(win, sub_all, total, minutes, spec, opts, header):
             va="bottom", ha="right", zorder=5)
     fig.tight_layout()
     return fig
-
-
+ 
+ 
 def timeline_figure(sub, total, lo, hi, label):
     fig, ax = plt.subplots(figsize=(9.4, 1.9))
     fig.patch.set_facecolor(BG)
@@ -315,8 +327,8 @@ def timeline_figure(sub, total, lo, hi, label):
     ax.spines["bottom"].set_color("#cfcfcf")
     fig.tight_layout()
     return fig
-
-
+ 
+ 
 def grid_figure(sub, total, window, spec, opts, team, label):
     edges = np.arange(0.0, total + 1e-9, window)
     if edges[-1] < total - 1e-9:
@@ -324,20 +336,20 @@ def grid_figure(sub, total, window, spec, opts, team, label):
     n = len(edges) - 1
     cols = 3
     rows = int(np.ceil(n / cols))
-
+ 
     pitch = make_pitch()
     val = spec["value"]
     ref = bin_density(pitch, sub, total, opts["bx"], opts["by"],
                       opts["sigma"], val if spec["diverging"] else None)
     shared = max(float(np.abs(ref["statistic"]).max()) * opts["vmax_mult"],
                  1e-9)
-
+ 
     fig, axes = pitch.grid(nrows=rows, ncols=cols, figheight=3.6 * rows,
                            title_height=0.06, endnote_height=0.0,
                            space=0.10, axis=False)
     fig.patch.set_facecolor(BG)
     pitch_axes = np.atleast_1d(axes["pitch"]).ravel()
-
+ 
     for i, ax in enumerate(pitch_axes):
         if i >= n:
             ax.set_visible(False)
@@ -352,18 +364,18 @@ def grid_figure(sub, total, window, spec, opts, team, label):
                                         vmax=shared))
         else:
             draw_heat(pitch, ax, stat, HEAT, vmin=0, vmax=shared)
-
+ 
         if opts["arrows"] and spec.get("arrows") and len(w):
             _draw_arrows(pitch, ax, w, "#2b2b2b", max_arrows=200)
         elif opts["show_events"] and len(w):
             pitch.scatter(w["x"], w["y"], ax=ax, s=11, facecolor="none",
                           edgecolor="#2b2b2b", linewidth=0.6, alpha=0.5,
                           zorder=4)
-
+ 
         extra = f"   {w[val].fillna(0).sum():+.2f}" if val else ""
         ax.set_title(f"{lo:.0f}′–{hi:.0f}′   {len(w)} ev{extra}",
                      fontsize=9.5, fontweight="bold")
-
+ 
     axes["title"].text(0.5, 0.5,
                        f"{team} — {label}, {window:.0f}-minute windows, "
                        f"common colour scale",
@@ -371,8 +383,43 @@ def grid_figure(sub, total, window, spec, opts, team, label):
                        fontweight="bold")
     axes["title"].axis("off")
     return fig
-
-
+ 
+ 
+def value_col_label(value_col):
+    return {"obv_for_net": "OBV"}.get(value_col, value_col)
+ 
+ 
+def zone_table(win, value_col=None):
+    """
+    Thirds AND halves in one table.
+ 
+    Boundaries are explicit masks rather than pd.cut, because the halfway line
+    matters: x == 60 belongs to the opposition half, and pd.cut's interval
+    closure would quietly put it in the own half. Thirds and halves overlap by
+    design — they are two ways of cutting the same events, so the block of five
+    rows does not sum to the total.
+    """
+    x = win["x"]
+    zones = [
+        ("Defensive third", x < 40),
+        ("Middle third", (x >= 40) & (x < 80)),
+        ("Final third", x >= 80),
+        ("Own half", x < 60),
+        ("Opposition half", x >= 60),
+    ]
+    total = max(len(win), 1)
+    rows = []
+    for name, mask in zones:
+        sub = win[mask]
+        row = {"zone": name, "events": int(len(sub)),
+               "%": round(100 * len(sub) / total, 1)}
+        if value_col:
+            row[value_col_label(value_col)] = round(
+                float(sub[value_col].fillna(0).sum()), 3)
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("zone")
+ 
+ 
 # ----------------------------------------------------------------------------
 # STREAMLIT VERSION COMPATIBILITY
 # ----------------------------------------------------------------------------
@@ -382,8 +429,8 @@ def stretch_button(col, label):
         return col.button(label, width="stretch")
     except TypeError:
         return col.button(label, use_container_width=True)
-
-
+ 
+ 
 def show_fig(fig):
     """`width=` is current; `use_container_width=` is needed on older builds."""
     try:
@@ -392,15 +439,15 @@ def show_fig(fig):
         st.pyplot(fig, use_container_width=True)
     finally:
         plt.close(fig)
-
-
+ 
+ 
 def show_df(df):
     try:
         st.dataframe(df, width="stretch")
     except TypeError:
         st.dataframe(df, use_container_width=True)
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
 # SIGN IN
 # ----------------------------------------------------------------------------
@@ -408,7 +455,7 @@ def sign_in():
     """
     Email and password fields in the sidebar, verified against the API before
     anything else loads.
-
+ 
     Env vars and .streamlit/secrets.toml only PREFILL the fields — they never
     bypass them, so a shared deployment always shows who is signed in and lets
     a different account be used. Nothing is written to disk.
@@ -421,9 +468,9 @@ def sign_in():
             pre_pw = pre_pw or st.secrets.get("SB_PASS", "")
         except Exception:
             pass
-
+ 
     st.sidebar.header("StatsBomb sign in")
-
+ 
     if st.session_state.get("authed"):
         st.sidebar.success(f"Signed in as {st.session_state['sb_user']}")
         if st.sidebar.button("Sign out"):
@@ -432,13 +479,13 @@ def sign_in():
             st.cache_data.clear()
             st.rerun()
         return st.session_state["sb_user"], st.session_state["sb_pw"]
-
+ 
     with st.sidebar.form("signin"):
         email = st.text_input("Email", value=pre_user,
                               placeholder="you@club.com")
         password = st.text_input("Password", value=pre_pw, type="password")
         submitted = st.form_submit_button("Connect")
-
+ 
     if submitted:
         if not (email and password):
             st.sidebar.error("Enter both an email and a password.")
@@ -460,16 +507,16 @@ def sign_in():
                 st.session_state["sb_user"] = email
                 st.session_state["sb_pw"] = password
                 st.rerun()
-
+ 
     return None, None
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
 # APP
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="Match Heatmap Explorer", layout="wide")
 st.title("Match Heatmap Explorer")
-
+ 
 user, pw = sign_in()
 if not (user and pw):
     st.info("Sign in with your StatsBomb email and password in the sidebar "
@@ -477,7 +524,7 @@ if not (user and pw):
     st.caption("Credentials are held for this browser session only and are "
                "not stored.")
     st.stop()
-
+ 
 with st.sidebar:
     st.header("Match")
     try:
@@ -485,7 +532,7 @@ with st.sidebar:
     except Exception as exc:
         st.error(f"Could not load competitions: {exc}")
         st.stop()
-
+ 
     # Competition names are NOT unique: "Premier League" exists in England,
     # Egypt, Ukraine and elsewhere, and men's and women's competitions share
     # names too. Selecting on name alone silently picks whichever row happens
@@ -498,7 +545,7 @@ with st.sidebar:
         if col not in comps.columns:
             comps[col] = default
         comps[col] = comps[col].fillna(default).astype(str)
-
+ 
     gender_counts = (comps.groupby(["country_name", "competition_name"])
                      ["competition_gender"].nunique())
     def comp_label(r):
@@ -508,19 +555,19 @@ with st.sidebar:
         return (f"{r['competition_name']} ({g})"
                 if multi and g else r["competition_name"])
     comps["comp_label"] = comps.apply(comp_label, axis=1)
-
+ 
     countries = sorted(comps["country_name"].unique())
     default_country = countries.index("England") if "England" in countries else 0
     country = st.selectbox("Country", countries, index=default_country)
-
+ 
     in_country = comps[comps["country_name"] == country]
     comp_choice = st.selectbox("Competition",
                                sorted(in_country["comp_label"].unique()))
-
+ 
     in_comp = in_country[in_country["comp_label"] == comp_choice]
     seasons = in_comp.sort_values("season_name", ascending=False)
     season_choice = st.selectbox("Season", seasons["season_name"].tolist())
-
+ 
     row = seasons[seasons["season_name"] == season_choice]
     if len(row) > 1:
         st.warning(f"{len(row)} rows match that selection — using the first. "
@@ -529,14 +576,14 @@ with st.sidebar:
     row = row.iloc[0]
     st.caption(f"competition_id {int(row['competition_id'])} · "
                f"season_id {int(row['season_id'])}")
-
+ 
     try:
         matches = load_matches(int(row["competition_id"]),
                                int(row["season_id"]), user, pw)
     except Exception as exc:
         st.error(f"Could not load fixtures: {exc}")
         st.stop()
-
+ 
     date_col = "match_date" if "match_date" in matches.columns else None
     if date_col:
         matches = matches.sort_values(date_col, ascending=False)
@@ -546,7 +593,7 @@ with st.sidebar:
         + " v " + matches["away_team.away_team_name"].astype(str))
     match_label = st.selectbox("Fixture", matches["label"].tolist())
     match_id = int(matches[matches["label"] == match_label]["match_id"].iloc[0])
-
+ 
 try:
     ev, total, durs = get_match_data(match_id, user, pw)
 except Exception as exc:
@@ -556,7 +603,7 @@ teams = sorted(ev["team.name"].dropna().unique().tolist())
 if len(teams) < 2:
     st.error(f"Expected two teams, found: {teams}")
     st.stop()
-
+ 
 with st.sidebar:
     st.header("View")
     team = st.radio("Team", teams, help="The two teams are in opposite "
@@ -565,20 +612,20 @@ with st.sidebar:
     metric = st.selectbox("Metric", list(METRICS), index=0)
     spec = METRICS[metric]
     st.caption(spec["help"])
-
+ 
     st.header("Window")
     tmax = float(np.ceil(total))
-
+ 
     # Two handles: drag either end to resize, drag the middle to scrub. A
     # single start slider made it awkward to land on specific second-half
     # minutes, which is the main thing this control is for.
     if "window" not in st.session_state:
         st.session_state.window = (0.0, min(DEFAULT_WINDOW, tmax))
-
+ 
     w0, w1 = st.session_state.window
     st.session_state.window = (float(np.clip(w0, 0.0, tmax)),
                                float(np.clip(w1, 0.0, tmax)))
-
+ 
     c1, c2, c3 = st.columns(3)
     shift = 0.0
     if stretch_button(c1, "◀ −1"):
@@ -592,11 +639,11 @@ with st.sidebar:
         span = b - a
         a = float(np.clip(a + shift, 0.0, tmax - span))
         st.session_state.window = (a, a + span)
-
+ 
     sel_lo, sel_hi = st.slider("Window (minutes)", 0.0, tmax, step=0.5,
                                key="window")
     sel_lo, sel_hi = float(sel_lo), float(sel_hi)
-
+ 
     # The minimum is applied to the ANALYSIS window, not by rewriting the
     # widget: Streamlit raises if session_state is modified after the widget
     # with that key exists. The handles stay where you put them and the
@@ -607,7 +654,7 @@ with st.sidebar:
         hi = min(lo + MIN_WINDOW, tmax)
         lo = max(0.0, hi - MIN_WINDOW)
         widened = True
-
+ 
     length = hi - lo
     if widened:
         st.caption(f"⚠ Widened to the {MIN_WINDOW:.0f}-minute minimum: "
@@ -615,7 +662,7 @@ with st.sidebar:
     else:
         st.caption(f"{lo:.1f}′ – {hi:.1f}′  ·  {length:.1f} min  "
                    f"(minimum {MIN_WINDOW:.0f})")
-
+ 
     st.header("Display")
     grid_mode = st.checkbox("Show grid of consecutive windows", value=False)
     arrows = st.checkbox("Draw passes/carries as arrows", value=True,
@@ -635,20 +682,20 @@ with st.sidebar:
         sigma = st.slider("Blur (bins)", 0.0, 4.0, 1.6, step=0.2)
         vmax_mult = st.slider("Colour ceiling (× match mean)", 1.0, 6.0, 2.5,
                               step=0.5)
-
+ 
 opts = dict(bx=bx, by=by, sigma=sigma, autoscale=autoscale,
             show_events=show_events, vmax_mult=vmax_mult, arrows=arrows)
-
+ 
 sub_all = ev[ev["team.name"] == team]
 if spec["types"]:
     sub_all = sub_all[sub_all["type.name"].isin(spec["types"])]
 if spec["value"]:
     sub_all = sub_all[sub_all[spec["value"]].notna()]
 sub_all = sub_all.dropna(subset=["x", "y"])
-
+ 
 win = sub_all[(sub_all["t"] >= lo) & (sub_all["t"] < hi)]
 minutes = max(hi - lo, MIN_WINDOW)
-
+ 
 # ---- headline numbers
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Window", f"{lo:.0f}′ – {hi:.0f}′", f"{hi - lo:.1f} min")
@@ -663,12 +710,12 @@ if spec["value"]:
 else:
     share = 100 * len(win) / max(len(sub_all), 1)
     m4.metric("Share of match", f"{share:.0f}%")
-
+ 
 if len(win) < 10:
     st.warning(f"Only {len(win)} events in this window. The heatmap is a few "
                f"points with a blur applied — read the markers, not the "
                f"shading.")
-
+ 
 label = metric
 if grid_mode:
     show_fig(grid_figure(sub_all, total, length, spec, opts, team,
@@ -683,24 +730,20 @@ else:
                              header))
         show_fig(timeline_figure(sub_all, total, lo, hi, label))
     with right:
-        st.subheader("Top zones")
+        st.subheader("Zones")
         if len(win):
-            thirds = pd.cut(win["x"], [0, 40, 80, 120],
-                            labels=["Defensive", "Middle", "Final"])
-            by_third = win.groupby(thirds, observed=False).size()
-            show_df(by_third.rename("events").to_frame())
-            if spec["value"]:
-                v = win.groupby(thirds, observed=False)[spec["value"]].sum()
-                show_df(v.round(3).rename(metric).to_frame())
+            show_df(zone_table(win, spec["value"]))
+            st.caption("Thirds and halves are two cuts of the same events, so "
+                       "the five rows don't sum to the total.")
         else:
             st.caption("No events in this window.")
-
+ 
         st.subheader("Players")
         if len(win) and "player.name" in win.columns:
             agg = (win.groupby("player.name").size()
                    .sort_values(ascending=False).head(10))
             show_df(agg.rename("events").to_frame())
-
+ 
 with st.expander("Match and data notes"):
     st.write(f"**Match {match_id}** — {match_label}")
     st.write(f"Playing time from events: **{total:.1f} min** "
@@ -714,3 +757,4 @@ with st.expander("Match and data notes"):
     st.write("Density is per minute, so window length does not change "
              "intensity. Coordinates are normalised so the acting team "
              "attacks toward x = 120.")
+ 
